@@ -8,7 +8,7 @@ permissions:
   contents: read
 concurrency:
   group: openpoker-bot
-  cancel-in-progress: true  # FIX: old run must die before new one starts, else 2 bots same key -> 4002
+  cancel-in-progress: false
 jobs:
   play-poker:
     runs-on: ubuntu-latest
@@ -23,48 +23,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run Bot (2-Hour Cycle)
-        id: runbot
         env:
           OPEN_POKER_API_KEY: ${{ secrets.OPEN_POKER_API_KEY }}
           BUY_IN_AMOUNT: '1000'
           MC_TIME_BUDGET: '1.2'
           MC_MAX_ITERS: '8000'
-          AUTO_PULL_ENABLED: '1'
-          PULL_MIN_HANDS: '500'
-          PULL_MIN_WIN_RATE: '0.14'
-          PULL_MAX_BUSTS: '4'
-          PULL_MAX_CONSEC_LOSSES: '25'
-        run: |
-          set +e
-          timeout 115m python -u bot6.py
-          CODE=$?
-          echo "bot_exit_code=$CODE" >> $GITHUB_OUTPUT
-          echo "Bot exit code: $CODE"
-          if [ -f stats.json ]; then echo "--- stats.json ---"; cat stats.json; fi
-          if [ -f PULLED.txt ]; then echo "--- PULLED.txt ---"; cat PULLED.txt; fi
-          exit 0
-      - name: Check if Guardian Pulled
-        id: checkpull
-        run: |
-          if [ -f PULLED.txt ]; then echo "pulled=true" >> $GITHUB_OUTPUT; echo "Guardian pulled - NOT retriggering"; else echo "pulled=false" >> $GITHUB_OUTPUT; echo "Normal end - will retrigger"; fi
-      - name: Upload Stats
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-stats-${{ github.run_number }}
-          path: |
-            stats.json
-            PULLED.txt
-          if-no-files-found: ignore
+        run: timeout 115m python -u bot6.py || true
       - name: Immediately Trigger Next 2-Hour Run
-        if: steps.checkpull.outputs.pulled != 'true'
+        if: success() || failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Waiting 90s so OpenPoker frees the old session before next run..."
-          sleep 90
-          gh workflow run run_bot.yml
-      - name: Guardian Pulled - Manual Action Required
-        if: steps.checkpull.outputs.pulled == 'true'
-        run: |
-          echo "::warning::Bot auto-pulled itself. Check stats.json / PULLED.txt artifact. Fix strategy, then manually run workflow again."
+        run: gh workflow run run_bot.yml
