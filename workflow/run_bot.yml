@@ -1,0 +1,36 @@
+name: Run OpenPoker Bot 24/7
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */2 * * *'
+permissions:
+  actions: write
+  contents: read
+concurrency:
+  group: openpoker-bot
+  cancel-in-progress: false
+jobs:
+  play-poker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Bot (2-Hour Cycle)
+        env:
+          OPEN_POKER_API_KEY: ${{ secrets.OPEN_POKER_API_KEY }}
+          BUY_IN_AMOUNT: '1000'
+          MC_TIME_BUDGET: '1.2'
+          MC_MAX_ITERS: '8000'
+        run: timeout 115m python -u bot6.py || true
+      - name: Immediately Trigger Next 2-Hour Run
+        if: success() || failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run run_bot.yml
