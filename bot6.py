@@ -492,7 +492,8 @@ class PokerEngineV5Master:
         if survival_mode:
             # Tighten everything: only premiums preflop, need much more equity postflop
             pf_score = pf_score - 8  # effectively raises all thresholds by 8
-            # postflop margins bumped below via survival_bonus raw_pot_odds=to_call/(pot+to_call) if (pot+to_call)>0 else 0.0; pot_odds=min(0.95, raw_pot_odds*icm_bubble_factor)
+            # postflop margins bumped below via survival_mode
+        raw_pot_odds=to_call/(pot+to_call) if (pot+to_call)>0 else 0.0; pot_odds=min(0.95, raw_pot_odds*icm_bubble_factor)
         board_info=analyze_board_and_draws(hole_cards, community_cards, self.evaluator); blocker_info=compute_blocker_effects(hole_cards, community_cards); blocker_score=blocker_info["blocker_score"]
         postflop_agg=0
         if street>=3 and to_call>0: postflop_agg=2 if (to_call>=pot*0.55 or to_call>=big_blind*8) else 1
