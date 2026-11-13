@@ -660,7 +660,7 @@ class OpenPokerClientV5:
         # FIX 2 - LEAK: old code printed Cards: <hole> | Board: <board> to GH Actions logs AND exposed via /health last_decision.
         # Now: position / stack / equity / action only. No cards anywhere.
         mode_tag="CONV-EARLY" if early_stopped else "FULL-DEEP"; win_rate_pct=(self.hands_won/self.hands_played*100) if self.hands_played else 0.0
-        self.last_action_summary=f"[{position} | Stack: {self.my_stack} | ICM-BF: {icm_bf:.2f} | WR: {win_rate_pct:.1f}%] Eq: {equity*100:.1f}% ({rollouts:,} sims [{mode_tag}] in {elapsed:.2f}s) -> {action.upper()} {amount}"
+        self.last_action_summary=f"[{position} | Stack: {self.my_stack} | Hands: {self.hands_won}/{self.hands_played} | WR: {win_rate_pct:.1f}% | ICM-BF: {icm_bf:.2f}] Eq: {equity*100:.1f}% ({rollouts:,} sims [{mode_tag}] in {elapsed:.2f}s) -> {action.upper()} {amount}"
         print(self.last_action_summary)
     async def run_forever(self):
         headers={"Authorization": f"Bearer {self.api_key}"}; header_kwarg=("additional_headers" if "additional_headers" in inspect.signature(websockets.connect).parameters else "extra_headers")
@@ -785,7 +785,7 @@ async def start_render_server(bot: OpenPokerClientV5):
     async def health_handler(request):
         uptime_min=int((time.time()-bot.boot_time)/60); win_rate=(bot.hands_won/bot.hands_played*100) if bot.hands_played else 0.0
         # No hole cards / board in health response (was leaking via last_decision)
-        status={"version":"v5.1-fixed+guardian","status":"online" if bot.connected else "reconnecting","uptime_minutes":uptime_min,"current_stack":bot.my_stack,"profit_lock_target":PROFIT_LOCK_STACK,"ratholes_completed":bot.ratholes_completed,"hands_played":bot.hands_played,"hands_won":bot.hands_won,"win_rate_pct":round(win_rate,2),"last_decision":bot.last_action_summary,"tracked_opponents":len(bot.tracker.stats),"sqlite_db":DB_PATH,"guardian_pulled":bot.guardian.pulled,"guardian_reason":bot.guardian.reason}
+        status={"version":"v5.2-pushed+guardian+ratelimit+graceful","status":"online" if bot.connected else "reconnecting","uptime_minutes":uptime_min,"current_stack":bot.my_stack,"profit_lock_target":PROFIT_LOCK_STACK,"ratholes_completed":bot.ratholes_completed,"hands_played":bot.hands_played,"hands_won":bot.hands_won,"win_rate_pct":round(win_rate,2),"last_decision":bot.last_action_summary,"tracked_opponents":len(bot.tracker.stats),"sqlite_db":DB_PATH,"guardian_pulled":bot.guardian.pulled,"guardian_reason":bot.guardian.reason}
         return web.json_response(status)
     app.router.add_get("/", health_handler); app.router.add_get("/health", health_handler)
     runner=web.AppRunner(app); await runner.setup(); site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start(); print(f"[Server] Health dashboard listening on http://0.0.0.0:{PORT}", flush=True)
