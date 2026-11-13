@@ -584,7 +584,7 @@ class PokerEngineV5Master:
 class OpenPokerClientV5:
     def __init__(self, api_key: str, ws_url: str, pool: ProcessPoolExecutor):
         self.api_key=api_key; self.ws_url=ws_url; self.tracker=OpponentTracker(DB_PATH); self.engine=PokerEngineV5Master(self.tracker, pool)
-        self.guardian=Guardian()
+        self.guardian=Guardian(); self._rate_limited_until=0.0; self._consec_failures=0; self._last_connect_at=0.0; self._ws=None; self._shutting_down=False
         self.bot_name=None; self.my_player_id=None; self.my_seat=None; self.my_stack=BUY_IN_AMOUNT; self.pending_rathole=False
         self.hole_cards=[]; self.community_cards=[]; self.dealer_seat=0; self.table_id=None; self.last_table_seq=0; self.players=[]; self.folded_seats=set(); self.last_aggressor_id=None; self.current_street_bet=False; self.line_plan=empty_line_plan(); self.hands_played=0; self.hands_won=0; self.ratholes_completed=0; self.last_action_summary="Waiting for first hand..."; self.connected=False; self.boot_time=time.time()
     def check_active_game(self):
@@ -663,12 +663,25 @@ class OpenPokerClientV5:
         self.last_action_summary=f"[{position} | Stack: {self.my_stack} | ICM-BF: {icm_bf:.2f} | WR: {win_rate_pct:.1f}%] Eq: {equity*100:.1f}% ({rollouts:,} sims [{mode_tag}] in {elapsed:.2f}s) -> {action.upper()} {amount}"
         print(self.last_action_summary)
     async def run_forever(self):
-        headers={"Authorization": f"Bearer {self.api_key}"}; header_kwarg=("additional_headers" if "additional_headers" in inspect.signature(websockets.connect).parameters else "extra_headers"); backoff=2
+        headers={"Authorization": f"Bearer {self.api_key}"}; header_kwarg=("additional_headers" if "additional_headers" in inspect.signature(websockets.connect).parameters else "extra_headers")
         while True:
             try:
-                active=await asyncio.to_thread(self.check_active_game); print(f"[Client] Connecting to {self.ws_url}...")
+                # Respect server rate-limit cooldown
+                _wait=max(0.0, self._rate_limited_until-time.time())
+                if _wait>0:
+                    print(f"[RateLimit] Waiting {_wait:.0f}s before reconnect...", flush=True); await asyncio.sleep(_wait)
+                # Exponential backoff that PERSISTS across fast disconnects (old code reset to 2s on every connect)
+                if self._consec_failures>0:
+                    _b=min(120, 5*(2**(self._consec_failures-1)))+random.uniform(0.5,2.0)
+                    print(f"[Reconnect] Attempt #{self._consec_failures+1} in {_b:.1f}s (not spamming)...", flush=True); await asyncio.sleep(_b)
+                # Don't call REST active-game on every fast retry - it adds to rate-limit pressure
+                active=None
+                if self._consec_failures==0:
+                    active=await asyncio.to_thread(self.check_active_game)
+                print(f"[Client] Connecting to {self.ws_url}...")
+                self._last_connect_at=time.time()
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20, **{header_kwarg: headers}) as ws:
-                    self.connected=True; backoff=2; print("[WebSocket] Connected to OpenPoker.")
+                    self._ws=ws; self.connected=True; print("[WebSocket] Connected to OpenPoker.")
                     await ws.send(json.dumps({"type": "set_auto_rebuy", "enabled": True}))
                     if active and active.get("playing") and active.get("table_id"):
                         self.table_id=active["table_id"]; print(f"[Resync] Resuming active table {self.table_id}..."); await ws.send(json.dumps({"type": "resync_request", "table_id": self.table_id, "last_table_seq": self.last_table_seq}))
@@ -678,9 +691,15 @@ class OpenPokerClientV5:
                         if "table_seq" in msg: self.last_table_seq=max(self.last_table_seq, msg["table_seq"])
                         if "table_id" in msg: self.table_id=msg["table_id"]
                         if msg_type=="connected":
-                            self.bot_name=msg.get("name"); self.my_player_id=msg.get("player_id") or msg.get("id"); print(f"[Server] Authenticated as: {self.bot_name or 'Bot'}")
+                            self.bot_name=msg.get("name"); self.my_player_id=msg.get("player_id") or msg.get("id"); print(f"[Server] Authenticated as: {self.bot_name or 'Bot'}"); self._consec_failures=0
                         elif msg_type=="error":
                             code=msg.get("code"); print(f"[Server Error] {code}: {msg.get('message')}")
+                            if code=="rate_limited":
+                                # FIX: old code ignored this and instantly reconnected -> 300-line loop -> longer ban.
+                                # Back off 90s and drop this socket; outer loop will wait before reconnecting.
+                                self._rate_limited_until=time.time()+90
+                                print(f"[RateLimit] Cooling down 90s, will NOT reconnect immediately", flush=True)
+                                await ws.close(); break
                             if code=="already_seated":
                                 if self.pending_rathole: await self.execute_rathole_leave_and_rejoin(ws)
                                 elif msg.get("table_id"):
@@ -747,10 +766,20 @@ class OpenPokerClientV5:
                             try: self.guardian.record_result(False, self.hands_played, self.hands_won)
                             except SystemExit: raise
                             await asyncio.sleep(3); await ws.send(json.dumps({"type": "join_lobby", "buy_in": BUY_IN_AMOUNT}))
-            except asyncio.CancelledError: print("[Shutdown] WebSocket loop cancelled cleanly.", flush=True); self.connected=False; raise
+            except asyncio.CancelledError: print("[Shutdown] WebSocket loop cancelled cleanly.", flush=True); self.connected=False; self._ws=None; raise
             except SystemExit: raise
             except Exception as e:
-                self.connected=False; jitter=random.uniform(0.5,2.0); wait_time=min(60, backoff+jitter); print(f"[Disconnected] {e}. Reconnecting in {wait_time:.1f}s..."); await asyncio.sleep(wait_time); backoff=min(60, backoff*2)
+                self.connected=False
+                _lived=time.time()-self._last_connect_at if self._last_connect_at else 999
+                # If socket lived >60s it was a real disconnect -> reset backoff. If <10s it was a fast fail / duplicate / rate-limit -> escalate.
+                if _lived>60: self._consec_failures=0
+                else: self._consec_failures+=1
+                _code=str(e)
+                if "4029" in _code or "rate" in _code.lower(): self._rate_limited_until=time.time()+90
+                if "4002" in _code:
+                    # 4002 = duplicate / old session still alive. Wait longer so old socket dies, don't fight it.
+                    print(f"[Duplicate] 4002: another session with same key is still alive. Waiting 30s...", flush=True); await asyncio.sleep(30)
+                print(f"[Disconnected] {e} (lived {_lived:.1f}s, failures={self._consec_failures}). Backing off, NOT instant-retry...", flush=True)
 async def start_render_server(bot: OpenPokerClientV5):
     app=web.Application()
     async def health_handler(request):
@@ -778,19 +807,17 @@ async def main():
     pool=ProcessPoolExecutor(**pool_kwargs); bot=OpenPokerClientV5(api_key=API_KEY, ws_url=WS_URL, pool=pool); await start_render_server(bot)
     stop_event=asyncio.Event(); loop=asyncio.get_running_loop()
     def handle_signal(sig, frame):
-        print(f"\n[Signal] Caught {sig}. Hard killing...", flush=True)
-        try: bot.tracker.flush_to_sqlite()
+        # GRACEFUL: do NOT os._exit here. That skips WS close, so OpenPoker thinks we're still connected.
+        # Just signal main() to stop - it will cancel bot_task -> async-with closes WS (close frame 1000) -> flush -> pool shutdown -> exit.
+        print(f"\n[Signal] Caught {sig}. Graceful shutdown requested, closing WS cleanly...", flush=True)
+        bot._shutting_down=True
+        try: stop_event.set()
         except Exception: pass
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-            for p in mp.active_children(): p.terminate()
-        except Exception: pass
-        os._exit(0)
     signal.signal(signal.SIGINT, handle_signal); signal.signal(signal.SIGTERM, handle_signal)
     print("[CANARY] Starting tasks...", flush=True); bot_task=asyncio.create_task(bot.run_forever()); ping_task=asyncio.create_task(self_ping_loop()); print(f"[Main] Bot started with {CPU_WORKERS} CPU workers. Waiting for shutdown...", flush=True)
     while not stop_event.is_set():
         await asyncio.sleep(1)
-        if bot_task.done():
+        if bot_task.done() and not stop_event.is_set() and not bot._shutting_down:
             print("[Fatal] Bot task crashed! Restarting in 5 seconds...", flush=True)
             if bot_task.exception(): print(f"Reason: {bot_task.exception()}", flush=True)
             await asyncio.sleep(5); bot_task=asyncio.create_task(bot.run_forever())
@@ -798,7 +825,16 @@ async def main():
             print("[Fatal] Ping task crashed! Restarting...", flush=True)
             if ping_task.exception(): print(f"Reason: {ping_task.exception()}", flush=True)
             ping_task=asyncio.create_task(self_ping_loop())
-    print("\n[Shutdown] SIGTERM or Ctrl+C received. Cleaning up...", flush=True); bot_task.cancel(); ping_task.cancel(); await asyncio.gather(bot_task, ping_task, return_exceptions=True); bot.tracker.flush_to_sqlite(); pool.shutdown(wait=False, cancel_futures=True); print("[Shutdown] Clean exit complete.", flush=True)
+    print("\n[Shutdown] SIGTERM or Ctrl+C received. Cleaning up...", flush=True)
+    try: bot_task.cancel(); ping_task.cancel(); await asyncio.wait_for(asyncio.gather(bot_task, ping_task, return_exceptions=True), timeout=5)
+    except Exception: pass
+    # Give WS a moment to send close frame before process dies
+    await asyncio.sleep(1.0)
+    try: bot.tracker.flush_to_sqlite()
+    except Exception: pass
+    try: pool.shutdown(wait=False, cancel_futures=True)
+    except Exception: pass
+    print("[Shutdown] Clean exit complete - WS closed, server should free the session.", flush=True)
 if __name__=="__main__":
     if sys.platform=="win32": asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try: asyncio.run(main())
