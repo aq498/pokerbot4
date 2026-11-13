@@ -39,7 +39,7 @@ TOURNAMENT_MODE = os.getenv("TOURNAMENT_MODE", "false").lower() == "true"
 AUTO_PULL_ENABLED = os.getenv("AUTO_PULL_ENABLED", "1") == "1"
 PULL_MIN_HANDS = int(os.getenv("PULL_MIN_HANDS", "500"))
 PULL_MIN_WIN_RATE = float(os.getenv("PULL_MIN_WIN_RATE", "0.14"))
-PULL_MAX_BUSTS = int(os.getenv("PULL_MAX_BUSTS", "4"))
+PULL_MAX_BUSTS = int(os.getenv("PULL_MAX_BUSTS", "2"))  # BUST-FIX: was 4, now 2 - stop earlier
 PULL_MAX_CONSEC_LOSSES = int(os.getenv("PULL_MAX_CONSEC_LOSSES", "25"))
 PULL_EXIT_CODE = 42
 FULL_DECK_INTS = Deck.GetFullDeck()
@@ -484,12 +484,20 @@ class PokerEngineV5Master:
         actions_map={a["action"]: a for a in valid_actions}; to_call=actions_map.get("call",{}).get("amount",0); raise_info=actions_map.get("raise") or actions_map.get("bet") or {}; min_raise=raise_info.get("min", big_blind*2); max_raise=raise_info.get("max", state.get("stack", BUY_IN_AMOUNT)); effective_stack=max(state.get("stack", BUY_IN_AMOUNT), to_call)
         # FIX: old code did max(stack, max_raise) — max_raise is a raise-TO amount, not stack, so it inflated stack/SPR. Stack only.
         if len(hole_cards)<2: return self.format_valid_action("check",0,valid_actions), 0.0, 0, False
-        hand_str=cards_to_hand_str(hole_cards[0], hole_cards[1]); pf_score=get_preflop_score(hand_str); tier=hand_preflop_tier(hand_str); in_position=position in ("BTN","CO"); street=len(community_cards); raw_pot_odds=to_call/(pot+to_call) if (pot+to_call)>0 else 0.0; pot_odds=min(0.95, raw_pot_odds*icm_bubble_factor)
+        hand_str=cards_to_hand_str(hole_cards[0], hole_cards[1]); pf_score=get_preflop_score(hand_str); tier=hand_preflop_tier(hand_str); in_position=position in ("BTN","CO"); street=len(community_cards);
+        # BUST-FIX: Survival mode - if we've busted recently or lost 10+ in a row, play NIT. No more hero calls.
+        # self.tracker doesn't have busts, Guardian does - we pass it via state in handle_your_turn (see below)
+        _busts = state.get("guardian_busts", 0); _consec = state.get("guardian_consec_losses", 0)
+        survival_mode = (_busts >= 1 or _consec >= 8)
+        if survival_mode:
+            # Tighten everything: only premiums preflop, need much more equity postflop
+            pf_score = pf_score - 8  # effectively raises all thresholds by 8
+            # postflop margins bumped below via survival_bonus raw_pot_odds=to_call/(pot+to_call) if (pot+to_call)>0 else 0.0; pot_odds=min(0.95, raw_pot_odds*icm_bubble_factor)
         board_info=analyze_board_and_draws(hole_cards, community_cards, self.evaluator); blocker_info=compute_blocker_effects(hole_cards, community_cards); blocker_score=blocker_info["blocker_score"]
         postflop_agg=0
         if street>=3 and to_call>0: postflop_agg=2 if (to_call>=pot*0.55 or to_call>=big_blind*8) else 1
         facing_3bet=(street==0 and to_call>big_blind*4.5); bayesian_weights=self.tracker.build_bayesian_range_weights(aggressor_id, preflop_raised=(to_call>big_blind), facing_3bet=facing_3bet)
-        req_call_threshold=min(0.90, pot_odds+(0.02 if in_position else 0.04)); value_bet_threshold=0.52 if in_position else 0.56; jam_threshold=0.70; decision_thresholds=[req_call_threshold, value_bet_threshold, jam_threshold]
+        req_call_threshold=min(0.90, pot_odds+(0.02 if in_position else 0.04)); value_bet_threshold=(0.62 if survival_mode else 0.52) if in_position else (0.66 if survival_mode else 0.56); jam_threshold=0.78 if survival_mode else 0.70; decision_thresholds=[req_call_threshold, value_bet_threshold, jam_threshold]
         min_t, max_t=self.compute_adaptive_budget(street, pot, to_call, big_blind)
         equity, rollouts, early_stopped=await self.estimate_equity_adaptive(hole_cards=hole_cards, community_cards=community_cards, num_opponents=active_opponents, bayesian_weights=bayesian_weights, postflop_aggression=postflop_agg, opp_bluff_freq=opp_bluff_freq, decision_thresholds=decision_thresholds, min_time=min_t, max_time=max_t)
         draw_bonus=0.0
@@ -526,6 +534,8 @@ class PokerEngineV5Master:
                 if position=="BB": return finish("check" if to_call==0 else "call", to_call)
                 if position=="SB" and (pf_score>=48 or hand_str.endswith("s")): return finish("call", to_call)
                 return finish("check" if to_call==0 else "fold",0)
+            if survival_mode and to_call>big_blind*2 and tier>=3:
+                return finish("fold",0)
             if to_call>big_blind*9:
                 if hand_str in ("AA","KK"): return finish("raise", max_raise)
                 if hand_str in ("QQ","AKs") and to_call<=effective_stack*0.45 and icm_bubble_factor<=1.15: return finish("call", to_call)
@@ -539,7 +549,7 @@ class PokerEngineV5Master:
             if self.sample_rng_blend(p_raise, plan.get("hand_id"), street) and active_opponents<=2: return finish("raise", three_bet_size)
             if position=="BB":
                 is_pocket_pair=hand_str[0]==hand_str[1]
-                if (pf_score>=48 or is_pocket_pair) and to_call<=effective_stack*0.15: return finish("call", to_call)
+                if (pf_score>=54 or is_pocket_pair) and to_call<=effective_stack*0.10: return finish("call", to_call)  # BUST-FIX: BB defend 48->54, 15%->10%
             if position in ("BTN","CO","SB") and hand_str.endswith("s") and pf_score>=52:
                 if to_call<=effective_stack*0.08 and to_call<=big_blind*3.0: return finish("call", to_call)
             if hand_str[0]==hand_str[1] and effective_stack>=to_call*8: return finish("call", to_call)
@@ -564,10 +574,10 @@ class PokerEngineV5Master:
         if board_info["playing_board"]: return finish("fold",0)
         if danger_board and not is_monster and to_call>pot*0.25 and not blocker_info["blocks_nut_flush"]: return finish("fold",0)
         if board_info["vulnerable_one_pair"] or rc>=8:
-            bluffer_bonus=0.12 if opp_bluff_freq>=0.35 else 0.0; max_one_pair_call=BUY_IN_AMOUNT*((0.45 if opp_af>2.2 else 0.30)+bluffer_bonus)
+            bluffer_bonus=0.12 if opp_bluff_freq>=0.35 else 0.0; max_one_pair_call=BUY_IN_AMOUNT*((0.35 if opp_af>2.2 else 0.22)+bluffer_bonus)  # BUST-FIX: reverted from 0.45/0.30, was calling off stacks with 1 pair
             if street>=4 and to_call>max_one_pair_call and adj_equity<(0.70-bluffer_bonus): return finish("fold",0)
             if street==5 and to_call>pot*0.65 and adj_equity<(0.62-bluffer_bonus) and opp_af<1.8: return finish("fold",0)
-        street_margin=0.01 if street==3 else (0.02 if street==4 else 0.03)
+        street_margin=(0.01 if street==3 else (0.02 if street==4 else 0.03)) + (0.06 if survival_mode else 0.0)
         if board_info["wet"]: street_margin+=0.01
         pos_margin=0.0 if in_position else 0.01; nit_margin=0.02 if (opp_af<0.9 and to_call>pot*0.5) else 0.0; blocker_discount=0.03 if (blocker_info["blocks_top_pair"] or blocker_info["unblocks_folding_range"]) else 0.0
         required_equity=pot_odds+street_margin+pos_margin+nit_margin-blocker_discount
@@ -652,7 +662,7 @@ class OpenPokerClientV5:
         opp_bluff_freq=self.tracker.get_bluff_frequency(self.last_aggressor_id) if self.last_aggressor_id else 0.22
         all_stacks=[int(p.get("stack", p.get("chips", BUY_IN_AMOUNT))) for p in self.players if isinstance(p, dict)] or [self.my_stack]
         icm_bf=compute_icm_bubble_factor(self.my_stack, all_stacks, PROFIT_LOCK_STACK)
-        state={"hole_cards": self.hole_cards, "community_cards": self.community_cards, "pot": pot, "valid_actions": valid_actions, "position": position, "big_blind": msg.get("big_blind",20), "stack": self.my_stack, "active_opponents": active_opponents, "aggressor_id": self.last_aggressor_id, "opp_af": opp_af, "opp_fold_freq": opp_fold_freq, "opp_bluff_freq": opp_bluff_freq, "icm_bubble_factor": icm_bf, "profit_lock_active": self.pending_rathole, "line_plan": self.line_plan}
+        state={"hole_cards": self.hole_cards, "community_cards": self.community_cards, "pot": pot, "valid_actions": valid_actions, "position": position, "big_blind": msg.get("big_blind",20), "stack": self.my_stack, "active_opponents": active_opponents, "aggressor_id": self.last_aggressor_id, "opp_af": opp_af, "opp_fold_freq": opp_fold_freq, "opp_bluff_freq": opp_bluff_freq, "icm_bubble_factor": icm_bf, "profit_lock_active": self.pending_rathole, "line_plan": self.line_plan, "guardian_busts": self.guardian.busts, "guardian_consec_losses": self.guardian.consec_losses}
         t0=time.perf_counter(); (action, amount), equity, rollouts, early_stopped=await self.engine.decide(state); self.line_plan=state.get("line_plan", self.line_plan); elapsed=time.perf_counter()-t0
         payload={"type": "action", "hand_id": hand_id, "client_action_id": str(uuid.uuid4()), "turn_token": turn_token, "action": action}
         if action in ("raise","bet","call") and amount and amount>0: payload["amount"]=int(amount)
@@ -785,7 +795,7 @@ async def start_render_server(bot: OpenPokerClientV5):
     async def health_handler(request):
         uptime_min=int((time.time()-bot.boot_time)/60); win_rate=(bot.hands_won/bot.hands_played*100) if bot.hands_played else 0.0
         # No hole cards / board in health response (was leaking via last_decision)
-        status={"version":"v5.2-pushed+guardian+ratelimit+graceful","status":"online" if bot.connected else "reconnecting","uptime_minutes":uptime_min,"current_stack":bot.my_stack,"profit_lock_target":PROFIT_LOCK_STACK,"ratholes_completed":bot.ratholes_completed,"hands_played":bot.hands_played,"hands_won":bot.hands_won,"win_rate_pct":round(win_rate,2),"last_decision":bot.last_action_summary,"tracked_opponents":len(bot.tracker.stats),"sqlite_db":DB_PATH,"guardian_pulled":bot.guardian.pulled,"guardian_reason":bot.guardian.reason}
+        status={"version":"v5.3-bustfix+survival+guardian","status":"online" if bot.connected else "reconnecting","uptime_minutes":uptime_min,"current_stack":bot.my_stack,"profit_lock_target":PROFIT_LOCK_STACK,"ratholes_completed":bot.ratholes_completed,"hands_played":bot.hands_played,"hands_won":bot.hands_won,"win_rate_pct":round(win_rate,2),"last_decision":bot.last_action_summary,"tracked_opponents":len(bot.tracker.stats),"sqlite_db":DB_PATH,"guardian_pulled":bot.guardian.pulled,"guardian_reason":bot.guardian.reason}
         return web.json_response(status)
     app.router.add_get("/", health_handler); app.router.add_get("/health", health_handler)
     runner=web.AppRunner(app); await runner.setup(); site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start(); print(f"[Server] Health dashboard listening on http://0.0.0.0:{PORT}", flush=True)
