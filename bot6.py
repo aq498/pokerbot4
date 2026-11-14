@@ -13,6 +13,30 @@ from aiohttp import web
 import requests, websockets
 from treys import Card, Evaluator, Deck
 gc.set_threshold(400, 5, 5)
+def log_hand_line(line: str):
+    """Write one decision line to hands.log (easy to find) AND print it. No cards in line - already card-free."""
+    try:
+        with open(HANDS_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {line}\n")
+    except Exception: pass
+    print(line, flush=True)
+
+def write_session_summary(bot):
+    """Write session_summary.txt - one small file with the final numbers, easy to find in Artifacts."""
+    try:
+        wr = (bot.hands_won/bot.hands_played*100) if bot.hands_played else 0.0
+        with open("session_summary.txt", "w", encoding="utf-8") as f:
+            f.write(f"Bot: {bot.bot_name or 'Winters'}\n")
+            f.write(f"Hands: {bot.hands_won}/{bot.hands_played}  WR: {wr:.1f}%\n")
+            f.write(f"Net Chips: {getattr(bot, 'net_chips', 0):+d}\n")
+            f.write(f"Total Profit (incl ratholes): {getattr(bot, 'total_profit', 0):+d}\n")
+            f.write(f"Current Stack: {bot.my_stack}\n")
+            f.write(f"Ratholes: {bot.ratholes_completed}\n")
+            f.write(f"Busts: {bot.guardian.busts}  Consec Losses: {bot.guardian.consec_losses}\n")
+            f.write(f"Guardian Pulled: {bot.guardian.pulled}  Reason: {bot.guardian.reason}\n")
+            f.write(f"Last Decision: {bot.last_action_summary}\n")
+    except Exception: pass
+
 def trim_process_memory():
     gc.collect()
     try:
@@ -27,6 +51,7 @@ REST_BASE_URL = os.getenv("OPEN_POKER_REST_URL", "https://openpoker.ai")
 PORT = int(os.getenv("PORT", 10000))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 DB_PATH = os.getenv("POKER_DB_PATH", "opponent_memory.db")
+HANDS_LOG_PATH = os.getenv("HANDS_LOG_PATH", "hands.log")  # <-- easy-to-find hands log, one line per decision
 CPU_WORKERS = int(os.getenv("CPU_WORKERS", "4"))
 TARGET_ACTION_TIME = float(os.getenv("TARGET_ACTION_TIME", "4.75"))
 MIN_ADAPTIVE_TIME = float(os.getenv("MIN_ADAPTIVE_TIME", "0.60"))
@@ -195,7 +220,7 @@ def analyze_board_and_draws(hole_cards, community_cards, evaluator: Evaluator):
 # --- Guardian (kept small, uses hands_won/hands_played already tracked by v5.1) ---
 class Guardian:
     def __init__(self):
-        self.busts=0; self.consec_losses=0; self.max_consec=0; self.last_100=[]; self.pulled=False; self.reason=""
+        self.busts=0; self.consec_losses=0; self.max_consec=0; self.last_100=[]; self.pulled=False; self.reason=""; self._net_chips=0
     def record_result(self, won: bool, hands: int, hands_won: int):
         if won: self.consec_losses=0
         else: self.consec_losses+=1; self.max_consec=max(self.max_consec,self.consec_losses)
@@ -204,11 +229,15 @@ class Guardian:
         # save stats.json (no cards)
         try:
             wr=(hands_won/hands) if hands else 0.0
-            with open("stats.json","w") as f: json.dump({"hands":hands,"hands_won":hands_won,"win_rate":round(wr,4),"rolling_100_wr":round(sum(self.last_100)/len(self.last_100),4) if self.last_100 else 0,"busts":self.busts,"consec_losses":self.consec_losses,"pulled":self.pulled,"pull_reason":self.reason},f,indent=2)
+            with open("stats.json","w") as f: json.dump({"hands":hands,"hands_won":hands_won,"win_rate":round(wr,4),"rolling_100_wr":round(sum(self.last_100)/len(self.last_100),4) if self.last_100 else 0,"busts":self.busts,"net_chips":self._net_chips,"consec_losses":self.consec_losses,"pulled":self.pulled,"pull_reason":self.reason},f,indent=2)
         except Exception: pass
         if not AUTO_PULL_ENABLED or self.pulled: return
         reason=""
-        if hands>=PULL_MIN_HANDS and (hands_won/hands if hands else 0)<PULL_MIN_WIN_RATE: reason=f"WR {(hands_won/hands):.1%} < {PULL_MIN_WIN_RATE:.0%} after {hands} hands"
+        # CHIPS > WR: if we're down 2 buy-ins after 200 hands, pull even if WR looks okay.
+        # WR can be padded by winning tiny pots and losing big ones.
+        _net_chips = getattr(self, '_net_chips', 0)
+        if hands>=200 and _net_chips<=-2000: reason=f"Chips {_net_chips} (down 2 buy-ins) after {hands} hands - losing chips despite WR"
+        elif hands>=PULL_MIN_HANDS and (hands_won/hands if hands else 0)<PULL_MIN_WIN_RATE: reason=f"WR {(hands_won/hands):.1%} < {PULL_MIN_WIN_RATE:.0%} after {hands} hands"
         elif self.busts>=PULL_MAX_BUSTS: reason=f"Busts {self.busts} >= {PULL_MAX_BUSTS}"
         elif self.consec_losses>=PULL_MAX_CONSEC_LOSSES: reason=f"Consec losses {self.consec_losses} >= {PULL_MAX_CONSEC_LOSSES}"
         elif hands>=300 and len(self.last_100)==100 and (sum(self.last_100)/100)<0.08: reason="Rolling 100 WR <8%"
@@ -584,6 +613,9 @@ class PokerEngineV5Master:
         required_equity=pot_odds+street_margin+pos_margin+nit_margin-blocker_discount
         if (is_monster and adj_equity>=0.76) or (is_trips_or_two_pair and adj_equity>=0.80):
             raise_target=max_raise if spr<=2.2 else best_sz; return finish("raise", raise_target)
+        # ALL-IN GUARD: never call off full stack with <50% equity unless pot odds are tiny
+        if to_call>=effective_stack*0.90 and adj_equity<0.50 and pot_odds>0.30:
+            return finish("fold",0)
         if plan.get("committed") and adj_equity>=max(0.38, pot_odds-0.05): return finish("call", to_call)
         if adj_equity>=required_equity: return finish("call", to_call)
         if adj_equity>=(required_equity-0.02) and self.sample_rng_blend(0.45, plan.get("hand_id"), street): return finish("call", to_call)
@@ -597,7 +629,7 @@ class OpenPokerClientV5:
         self.api_key=api_key; self.ws_url=ws_url; self.tracker=OpponentTracker(DB_PATH); self.engine=PokerEngineV5Master(self.tracker, pool)
         self.guardian=Guardian(); self._rate_limited_until=0.0; self._consec_failures=0; self._last_connect_at=0.0; self._ws=None; self._shutting_down=False
         self.bot_name=None; self.my_player_id=None; self.my_seat=None; self.my_stack=BUY_IN_AMOUNT; self.pending_rathole=False
-        self.hole_cards=[]; self.community_cards=[]; self.dealer_seat=0; self.table_id=None; self.last_table_seq=0; self.players=[]; self.folded_seats=set(); self.last_aggressor_id=None; self.current_street_bet=False; self.line_plan=empty_line_plan(); self.hands_played=0; self.hands_won=0; self.ratholes_completed=0; self.last_action_summary="Waiting for first hand..."; self.connected=False; self.boot_time=time.time()
+        self.hole_cards=[]; self.community_cards=[]; self.dealer_seat=0; self.table_id=None; self.last_table_seq=0; self.players=[]; self.folded_seats=set(); self.last_aggressor_id=None; self.current_street_bet=False; self.line_plan=empty_line_plan(); self.hands_played=0; self.hands_won=0; self.ratholes_completed=0; self.hand_start_stack=BUY_IN_AMOUNT; self.net_chips=0; self.total_profit=0; self.last_action_summary="Waiting for first hand..."; self.connected=False; self.boot_time=time.time()
     def check_active_game(self):
         headers={"Authorization": f"Bearer {self.api_key}"}
         try:
@@ -671,8 +703,9 @@ class OpenPokerClientV5:
         # FIX 2 - LEAK: old code printed Cards: <hole> | Board: <board> to GH Actions logs AND exposed via /health last_decision.
         # Now: position / stack / equity / action only. No cards anywhere.
         mode_tag="CONV-EARLY" if early_stopped else "FULL-DEEP"; win_rate_pct=(self.hands_won/self.hands_played*100) if self.hands_played else 0.0
-        self.last_action_summary=f"[{position} | Stack: {self.my_stack} | Hands: {self.hands_won}/{self.hands_played} | WR: {win_rate_pct:.1f}% | ICM-BF: {icm_bf:.2f}] Eq: {equity*100:.1f}% ({rollouts:,} sims [{mode_tag}] in {elapsed:.2f}s) -> {action.upper()} {amount}"
-        print(self.last_action_summary)
+        self.last_action_summary=f"[{position} | Stack: {self.my_stack} | Chips: {getattr(self, 'net_chips', 0):+d} | Profit: {getattr(self, 'total_profit', 0):+d} | Hands: {self.hands_won}/{self.hands_played} | WR: {win_rate_pct:.1f}%] Eq: {equity*100:.1f}% ({rollouts:,} sims [{mode_tag}] in {elapsed:.2f}s) -> {action.upper()} {amount}"
+        log_hand_line(self.last_action_summary)
+        if self.hands_played%50==0: write_session_summary(self)
     async def run_forever(self):
         headers={"Authorization": f"Bearer {self.api_key}"}; header_kwarg=("additional_headers" if "additional_headers" in inspect.signature(websockets.connect).parameters else "extra_headers")
         while True:
@@ -718,7 +751,7 @@ class OpenPokerClientV5:
                             elif code=="insufficient_season_chips":
                                 print("[Bankroll] Low season chips. Triggering rebuy..."); await ws.send(json.dumps({"type": "rebuy", "amount": 0})); await asyncio.sleep(2); await ws.send(json.dumps({"type": "join_lobby", "buy_in": 1000}))
                         elif msg_type in ("hand_start","new_hand"):
-                            self.hands_played+=1; self.hole_cards=[]; self.community_cards=[]; self.folded_seats.clear(); self.last_aggressor_id=None; self.current_street_bet=False; self.line_plan=empty_line_plan(msg.get("hand_id"))
+                            self.hands_played+=1; self.hand_start_stack=self.my_stack; self.hole_cards=[]; self.community_cards=[]; self.folded_seats.clear(); self.last_aggressor_id=None; self.current_street_bet=False; self.line_plan=empty_line_plan(msg.get("hand_id"))
                             if "seat" in msg or "your_seat" in msg: self.my_seat=msg.get("seat", msg.get("your_seat", self.my_seat))
                             self.dealer_seat=msg.get("dealer_seat", msg.get("button_seat", msg.get("dealer",0)))
                             if "players" in msg: self.update_hero_info_from_players(msg["players"])
@@ -740,6 +773,17 @@ class OpenPokerClientV5:
                                 elif isinstance(w, int) and self.my_seat is not None and w==self.my_seat: won=True
                                 elif isinstance(w, str) and self.bot_name and w==self.bot_name: won=True
                             if won: self.hands_won+=1
+                            # CHIPS tracking: stack delta this hand = chips won/lost this hand
+                            try:
+                                _new_stack = int(msg.get("stack", msg.get("new_stack", self.my_stack)) or self.my_stack)
+                                if _new_stack>0 and self.hand_start_stack>0:
+                                    _delta = _new_stack - self.hand_start_stack
+                                    # Ignore rebuy jumps (busted -> 1000) - those are handled by busts, not chip delta
+                                    if abs(_delta)<5000:
+                                        self.net_chips += _delta; self.guardian._net_chips = self.net_chips
+                                        # Total profit incl locked rathole profit: stack - buyin + 4000 per rathole
+                                        self.total_profit = (self.my_stack - BUY_IN_AMOUNT) + self.ratholes_completed*(PROFIT_LOCK_STACK - BUY_IN_AMOUNT)
+                            except Exception: pass
                             # Guardian: uses this hand's win/loss (not just hands_won counter)
                             try: self.guardian.record_result(won, self.hands_played, self.hands_won)
                             except SystemExit: raise
@@ -796,7 +840,7 @@ async def start_render_server(bot: OpenPokerClientV5):
     async def health_handler(request):
         uptime_min=int((time.time()-bot.boot_time)/60); win_rate=(bot.hands_won/bot.hands_played*100) if bot.hands_played else 0.0
         # No hole cards / board in health response (was leaking via last_decision)
-        status={"version":"v5.3-bustfix+survival+guardian","status":"online" if bot.connected else "reconnecting","uptime_minutes":uptime_min,"current_stack":bot.my_stack,"profit_lock_target":PROFIT_LOCK_STACK,"ratholes_completed":bot.ratholes_completed,"hands_played":bot.hands_played,"hands_won":bot.hands_won,"win_rate_pct":round(win_rate,2),"last_decision":bot.last_action_summary,"tracked_opponents":len(bot.tracker.stats),"sqlite_db":DB_PATH,"guardian_pulled":bot.guardian.pulled,"guardian_reason":bot.guardian.reason}
+        status={"version":"v5.6-chips+handslog","status":"online" if bot.connected else "reconnecting","uptime_minutes":uptime_min,"current_stack":bot.my_stack,"profit_lock_target":PROFIT_LOCK_STACK,"ratholes_completed":bot.ratholes_completed,"hands_played":bot.hands_played,"hands_won":bot.hands_won,"net_chips":getattr(bot,"net_chips",0),"total_profit":getattr(bot,"total_profit",0),"win_rate_pct":round(win_rate,2),"last_decision":bot.last_action_summary,"tracked_opponents":len(bot.tracker.stats),"sqlite_db":DB_PATH,"guardian_pulled":bot.guardian.pulled,"guardian_reason":bot.guardian.reason}
         return web.json_response(status)
     app.router.add_get("/", health_handler); app.router.add_get("/health", health_handler)
     runner=web.AppRunner(app); await runner.setup(); site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start(); print(f"[Server] Health dashboard listening on http://0.0.0.0:{PORT}", flush=True)
@@ -845,9 +889,14 @@ async def main():
     except Exception: pass
     try: pool.shutdown(wait=False, cancel_futures=True)
     except Exception: pass
+    try: write_session_summary(bot)
+    except Exception: pass
     print("[Shutdown] Clean exit complete - WS closed, server should free the session.", flush=True)
+    print("[Files] Check hands.log + session_summary.txt + stats.json in this folder / Artifacts", flush=True)
 if __name__=="__main__":
     if sys.platform=="win32": asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try: asyncio.run(main())
-    except SystemExit as e: print(f"[Exit] code={e.code}", flush=True); raise
+    except SystemExit as e:
+        if e.code==42: print(f"[Exit] Guardian pulled cleanly (code 42) - this is intentional, not a crash. Check PULLED.txt / stats.json", flush=True)
+        else: print(f"[Exit] code={e.code}", flush=True); raise
     except (KeyboardInterrupt, SystemExit): print("\n[Shutdown] Bot stopped cleanly.", flush=True)
